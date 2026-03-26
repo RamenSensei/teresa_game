@@ -1,0 +1,1855 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Tower Rescue - Duck Knight</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #050403; touch-action: none; user-select: none; -webkit-user-select: none; }
+canvas { display: block; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+// ============================================================
+// Tower Rescue - Pure Frontend Reimplementation
+// ============================================================
+
+const CANVAS = document.getElementById('game');
+const CTX = CANVAS.getContext('2d');
+
+// --- Constants (from Unity source) ---
+const RANDOM_SEED = 20260325;
+const TOTAL_PLATFORMS = 15;
+const GRAVITY = 12.5;
+const MAX_DT = 1 / 60;
+const CAMERA_SIZE = 4.95; // orthographic half-height in world units
+const CAMERA_FOCUS_X = 0.28;
+const CAMERA_FOCUS_Y = 0.33;
+const INTRO_CAMERA_EXTRA_Y = 0.55;
+const VICTORY_CAMERA_FOCUS_X = 0.42;
+const VICTORY_CAMERA_FOCUS_Y = 0.4;
+const DEFEAT_CAMERA_FOCUS_X = 0.31;
+const DEFEAT_CAMERA_FOCUS_Y = 0.37;
+const DEFEAT_CAMERA_DROP = -0.35;
+const CAMERA_SMOOTH = 0.28;
+const CAMERA_SMOOTH_CINE = 0.34;
+const CAMERA_ORBIT_X = 0.22;
+const CAMERA_ORBIT_Y = 0.1;
+const CAMERA_ORBIT_FREQ = 0.22;
+const LANDING_GRACE_X = 0.34;
+const LANDING_GRACE_Y = 0.16;
+const FAIL_DROP_DISTANCE = 4.4;
+const OVERLAY_FADE = 5;
+const TARGET_ASPECT = 1170 / 2532;
+
+// Bounce controller constants (tuned for stronger launches + wider arc)
+const COMPRESSION_DEADZONE = 18;
+const COMPRESSION_H_DEADZONE = 112;
+const COMPRESSION_MAX_DRAG = 220;
+const COMPRESSION_MIN_Y = 5.6;
+const COMPRESSION_MAX_Y = 8.5;
+const COMPRESSION_BASE_X = 2.2;
+const COMPRESSION_STEER_X = 3.0;
+const REBOUND_MIN_Y = 5.0;
+const REBOUND_MAX_Y = 9.0;
+const BASE_FORWARD_X = 1.8;
+const MAX_STEER_X = 3.5;
+const LATERAL_SWIPE_THRESHOLD = 980;
+const SWIPE_SAMPLE_PX = 8;
+const UP_SWIPE_THRESHOLD = 420;
+const DOWN_SWIPE_THRESHOLD = 380;
+const COMPRESSION_H_INTENT_RATIO = 0.48;
+const LATERAL_SWIPE_INTENT_RATIO = 0.72;
+const SWIPE_BUFFER_LIFETIME = 0.24;
+const REBOUND_WINDOW_DURATION = 0.26;
+const ENERGY_DECAY = 0.89;
+const ENERGY_GAIN = 0.32;
+const ENERGY_SEED = 0.32;
+const MIN_ENERGY = 0.18;
+const DIVE_GRAVITY_MUL = 1.6;
+const GROUND_SWIPE_X_IMP = 1.2;
+const GROUND_SWIPE_Y_IMP = 1.7;
+const AIR_SWIPE_X_IMP = 1.5;
+const AIR_SWIPE_Y_IMP = 1.95;
+const GROUND_SWIPE_MUL = 1.18;
+const ALIGNED_SWIPE_MUL = 1.22;
+const OPPOSING_SWIPE_MUL = 0.42;
+
+// Rendering scale: pixels per world unit
+let PPU = 80;
+let CANVAS_W = 0, CANVAS_H = 0;
+
+// --- Seeded RNG ---
+function seededRandom(seed) {
+  let s = seed;
+  return function() {
+    s = (s * 16807 + 0) % 2147483647;
+    return (s - 1) / 2147483646;
+  };
+}
+
+function randomRange(rng, min, max) {
+  return min + rng() * (max - min);
+}
+
+// --- Math helpers ---
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+function lerp(a, b, t) { return a + (b - a) * t; }
+function inverseLerp(a, b, v) { return a === b ? 0 : clamp((v - a) / (b - a), 0, 1); }
+function smoothDamp(current, target, velObj, smoothTime, dt) {
+  smoothTime = Math.max(0.0001, smoothTime);
+  const omega = 2 / smoothTime;
+  const x = omega * dt;
+  const exp = 1 / (1 + x + 0.48 * x * x + 0.235 * x * x * x);
+  const change = current - target;
+  const temp = (velObj.v + omega * change) * dt;
+  velObj.v = (velObj.v - omega * temp) * exp;
+  return target + (change + temp) * exp;
+}
+
+// --- Brick tile loading ---
+const BRICK_IMAGES = [];
+let bricksLoaded = 0;
+const TOTAL_BRICKS = 16;
+
+for (let i = 1; i <= TOTAL_BRICKS; i++) {
+  const img = new Image();
+  img.src = `41st素材/bricks_assets/brick_${String(i).padStart(2, '0')}.png`;
+  img.onload = () => { bricksLoaded++; };
+  BRICK_IMAGES.push(img);
+}
+
+// --- Platform generation ---
+const platforms = [];
+function buildLevel() {
+  platforms.length = 0;
+  const rng = seededRandom(RANDOM_SEED);
+  const typeRng = seededRandom(RANDOM_SEED + 999);
+  let px = 0, py = 0;
+  for (let i = 0; i < TOTAL_PLATFORMS; i++) {
+    const isStart = i === 0;
+    const isGoal = i === TOTAL_PLATFORMS - 1;
+    const progress = i / (TOTAL_PLATFORMS - 1);
+    if (!isStart) {
+      const rise = randomRange(rng, lerp(1.55, 1.95, progress), lerp(2.15, 2.7, progress));
+      const run = randomRange(rng, lerp(2.05, 2.35, progress), lerp(2.95, 3.45, progress));
+      px += run;
+      py += rise;
+    }
+    const width = isStart ? 2.2 : isGoal ? 2.35 : lerp(1.7, 1.26, progress) + randomRange(rng, -0.06, 0.06);
+    const thickness = isGoal ? 0.21 : lerp(0.16, 0.12, progress);
+
+    // Determine platform type
+    let type = 'normal';
+    if (!isStart && !isGoal) {
+      const roll = typeRng();
+      if (roll < 0.22) type = 'spring';
+      else if (roll < 0.40) type = 'crumble';
+      else if (roll < 0.55) type = 'moving';
+    }
+
+    platforms.push({
+      index: i, x: px, y: py, width, thickness, isGoal,
+      type: type,
+      baseX: px,
+      moveAmplitude: type === 'moving' ? 0.8 : 0,
+      moveSpeed: type === 'moving' ? (Math.PI * 2 / 4) : 0,
+      movePhase: type === 'moving' ? typeRng() * Math.PI * 2 : 0,
+      crumbleTimer: 0,
+      crumbleActive: false,
+      crumbleDuration: 1.2,
+      crumbled: false,
+    });
+  }
+}
+
+// --- Bounce Controller ---
+function createBounceController() {
+  const ctrl = {
+    posX: 0, posY: 0,
+    velX: 0, velY: 0,
+    currentPlatformIndex: 0,
+    isGrounded: true,
+    isCompressing: false,
+    isDiving: false,
+    compression01: 0,
+    bounceEnergy01: ENERGY_SEED,
+    reboundWindowTimer: 0,
+    pointerAnchorX: 0, pointerAnchorY: 0,
+    pointerPosX: 0, pointerPosY: 0,
+    pointerVelX: 0, pointerVelY: 0,
+    bufferedSwipeVelX: 0, bufferedSwipeVelY: 0,
+    bufferedSwipeAge: 1e9,
+    bufferedSwipePending: false,
+    // Landing info for effects
+    lastLandingVelY: 0,
+    lastLandingOffsetX: 0,
+    lastLandingPlatWidth: 0,
+    justLanded: false,
+  };
+
+  ctrl.reset = function(sx, sy, platIdx) {
+    this.posX = sx; this.posY = sy;
+    this.velX = 0; this.velY = 0;
+    this.currentPlatformIndex = platIdx;
+    this.isGrounded = true; this.isCompressing = false; this.isDiving = false;
+    this.compression01 = 0; this.bounceEnergy01 = ENERGY_SEED;
+    this.reboundWindowTimer = 0;
+    this.pointerAnchorX = 0; this.pointerAnchorY = 0;
+    this.pointerPosX = 0; this.pointerPosY = 0;
+    this.pointerVelX = 0; this.pointerVelY = 0;
+    this.bufferedSwipeVelX = 0; this.bufferedSwipeVelY = 0;
+    this.bufferedSwipeAge = 1e9; this.bufferedSwipePending = false;
+    this.lastLandingVelY = 0;
+    this.lastLandingOffsetX = 0;
+    this.lastLandingPlatWidth = 0;
+    this.justLanded = false;
+  };
+
+  ctrl.reboundWindow01 = function() {
+    return REBOUND_WINDOW_DURATION <= 0 ? 0 : clamp(this.reboundWindowTimer / REBOUND_WINDOW_DURATION, 0, 1);
+  };
+
+  ctrl.hasRecentSwipe = function() {
+    return this.bufferedSwipePending && this.bufferedSwipeAge <= SWIPE_BUFFER_LIFETIME;
+  };
+
+  ctrl.consumeBufferedSwipe = function() {
+    this.bufferedSwipePending = false;
+    this.bufferedSwipeAge = 1e9;
+  };
+
+  ctrl.updatePointer = function(input, dt) {
+    this.bufferedSwipeAge += dt;
+    const hasSim = input.simSwipeX * input.simSwipeX + input.simSwipeY * input.simSwipeY > 0.001;
+    const hasPtr = input.started || input.held || input.released;
+    if (!hasPtr && !hasSim) { this.pointerVelX = 0; this.pointerVelY = 0; return; }
+    if (input.started) {
+      this.pointerAnchorX = input.screenX; this.pointerAnchorY = input.screenY;
+      this.pointerPosX = input.screenX; this.pointerPosY = input.screenY;
+      this.pointerVelX = 0; this.pointerVelY = 0;
+    } else if (hasPtr) {
+      const prevX = this.pointerPosX, prevY = this.pointerPosY;
+      this.pointerPosX = input.screenX; this.pointerPosY = input.screenY;
+      const dx = this.pointerPosX - prevX, dy = this.pointerPosY - prevY;
+      this.pointerVelX = dt > 0.0001 ? dx / dt : 0;
+      // Negate Y: in web, screen Y increases downward, but game expects Y-up
+      this.pointerVelY = dt > 0.0001 ? -dy / dt : 0;
+      if (dx * dx + dy * dy >= SWIPE_SAMPLE_PX * SWIPE_SAMPLE_PX) {
+        this.bufferedSwipeVelX = this.pointerVelX;
+        this.bufferedSwipeVelY = this.pointerVelY;
+        this.bufferedSwipeAge = 0;
+        this.bufferedSwipePending = true;
+      }
+    }
+    if (!hasSim) return;
+    this.pointerVelX = input.simSwipeX;
+    this.pointerVelY = input.simSwipeY;
+    this.bufferedSwipeVelX = input.simSwipeX;
+    this.bufferedSwipeVelY = input.simSwipeY;
+    this.bufferedSwipeAge = 0;
+    this.bufferedSwipePending = true;
+  };
+
+  function evaluateCompression(anchorX, anchorY, curX, curY) {
+    // In screen coords, dragging DOWN means curY > anchorY (canvas Y increases downward)
+    const dragDown = Math.max(0, curY - anchorY);
+    return inverseLerp(COMPRESSION_DEADZONE, COMPRESSION_MAX_DRAG, dragDown);
+  }
+
+  function hasIntentionalHDisplacement(dx, dy) {
+    return Math.abs(dx) >= COMPRESSION_H_DEADZONE && Math.abs(dx) >= Math.abs(dy) * COMPRESSION_H_INTENT_RATIO;
+  }
+
+  function tryGetIntentionalLateralSwipeX(svx, svy) {
+    if (Math.abs(svx) >= LATERAL_SWIPE_THRESHOLD && Math.abs(svx) >= Math.abs(svy) * LATERAL_SWIPE_INTENT_RATIO) {
+      return { ok: true, x: svx };
+    }
+    return { ok: false, x: 0 };
+  }
+
+  function evalHFromDisplacement(dx, sameDir, baseX, maxX) {
+    const dir = sameDir ? Math.sign(dx) : -Math.sign(dx);
+    const sp = inverseLerp(COMPRESSION_H_DEADZONE, COMPRESSION_MAX_DRAG, Math.abs(dx));
+    return dir * lerp(baseX, maxX, sp);
+  }
+
+  function evalHFromSwipe(svx, sameDir, baseX, maxX) {
+    const dir = sameDir ? Math.sign(svx) : -Math.sign(svx);
+    const sp = inverseLerp(LATERAL_SWIPE_THRESHOLD, UP_SWIPE_THRESHOLD * 4, Math.abs(svx));
+    return dir * lerp(baseX, maxX, sp);
+  }
+
+  ctrl.evaluateCompressionHorizontalX = function() {
+    const hDelta = this.pointerPosX - this.pointerAnchorX;
+    const vDelta = this.pointerPosY - this.pointerAnchorY;
+    if (hasIntentionalHDisplacement(hDelta, vDelta)) {
+      const sp = inverseLerp(COMPRESSION_H_DEADZONE, COMPRESSION_MAX_DRAG, Math.abs(hDelta));
+      if (hDelta >= 0) {
+        return lerp(COMPRESSION_BASE_X, COMPRESSION_STEER_X, sp);
+      } else {
+        return lerp(COMPRESSION_BASE_X, -0.5, sp);
+      }
+    }
+    if (this.hasRecentSwipe()) {
+      const lat = tryGetIntentionalLateralSwipeX(this.bufferedSwipeVelX, this.bufferedSwipeVelY);
+      if (lat.ok) {
+        const sp = inverseLerp(LATERAL_SWIPE_THRESHOLD, UP_SWIPE_THRESHOLD * 4, Math.abs(lat.x));
+        if (lat.x >= 0) {
+          return lerp(COMPRESSION_BASE_X, COMPRESSION_STEER_X, sp);
+        } else {
+          return lerp(COMPRESSION_BASE_X, -0.5, sp);
+        }
+      }
+    }
+    return COMPRESSION_BASE_X;
+  };
+
+  ctrl.buildCompressionVelocity = function() {
+    const str = evaluateCompression(this.pointerAnchorX, this.pointerAnchorY, this.pointerPosX, this.pointerPosY);
+    if (str <= 0) return { vx: 0, vy: 0, strength: 0 };
+    const vx = this.evaluateCompressionHorizontalX();
+    const vy = lerp(COMPRESSION_MIN_Y, COMPRESSION_MAX_Y, str) * lerp(0.94, 1.06, this.bounceEnergy01);
+    return { vx, vy, strength: str };
+  };
+
+  function buildSwipeImpulse(svx, svy, maxXI, maxYI) {
+    const lat = tryGetIntentionalLateralSwipeX(svx, svy);
+    const xIntent = lat.ok ? inverseLerp(LATERAL_SWIPE_THRESHOLD, LATERAL_SWIPE_THRESHOLD * 2.4, Math.abs(lat.x)) : 0;
+    const xi = Math.sign(svx) * xIntent * maxXI;
+    let yi = 0;
+    if (svy >= UP_SWIPE_THRESHOLD) {
+      yi = inverseLerp(UP_SWIPE_THRESHOLD, UP_SWIPE_THRESHOLD * 2.8, svy) * maxYI;
+    } else if (svy <= -DOWN_SWIPE_THRESHOLD) {
+      yi = -inverseLerp(DOWN_SWIPE_THRESHOLD, DOWN_SWIPE_THRESHOLD * 2.8, -svy) * maxYI;
+    }
+    return { x: xi, y: yi };
+  }
+
+  function swipeAlignmentMul(bvx, bvy, six, siy) {
+    const bm = Math.sqrt(bvx * bvx + bvy * bvy);
+    const sm = Math.sqrt(six * six + siy * siy);
+    if (bm <= 0.001 || sm <= 0.001) return 1;
+    const dot = (bvx / bm) * (six / sm) + (bvy / bm) * (siy / sm);
+    if (dot >= 0) return lerp(0.95, ALIGNED_SWIPE_MUL, dot);
+    return lerp(OPPOSING_SWIPE_MUL, 0.95, dot + 1);
+  }
+
+  function applySwipeForce(bvx, bvy, six, siy, grounded) {
+    const mul = grounded ? GROUND_SWIPE_MUL : swipeAlignmentMul(bvx, bvy, six, siy);
+    let rx = bvx + six * mul;
+    let ry = bvy + siy * mul;
+    rx = clamp(rx, -MAX_STEER_X, MAX_STEER_X);
+    ry = Math.max(1.8, ry);
+    return { x: rx, y: ry };
+  }
+
+  function clampLaunchVel(vx, vy) {
+    vx = clamp(vx, -MAX_STEER_X, MAX_STEER_X);
+    vy = clamp(vy, 2.2, REBOUND_MAX_Y + GROUND_SWIPE_Y_IMP * GROUND_SWIPE_MUL);
+    return { x: vx, y: vy };
+  }
+
+  ctrl.tryPeekBufferedSwipe = function() {
+    if (!this.hasRecentSwipe()) return null;
+    const svx = this.bufferedSwipeVelX, svy = this.bufferedSwipeVelY;
+    const hasX = Math.abs(svx) >= LATERAL_SWIPE_THRESHOLD;
+    const hasY = svy >= UP_SWIPE_THRESHOLD || svy <= -DOWN_SWIPE_THRESHOLD;
+    if (!hasX && !hasY) return null;
+    const x01 = hasX ? inverseLerp(LATERAL_SWIPE_THRESHOLD, LATERAL_SWIPE_THRESHOLD * 2.4, Math.abs(svx)) : 0;
+    const yTh = svy >= 0 ? UP_SWIPE_THRESHOLD : DOWN_SWIPE_THRESHOLD;
+    const y01 = hasY ? inverseLerp(yTh, yTh * 2.8, Math.abs(svy)) : 0;
+    const str = clamp(Math.max(x01, y01), 0, 1);
+    if (str <= 0) return null;
+    return { svx, svy, strength: str };
+  };
+
+  ctrl.tryBuildReboundVelocity = function(consume) {
+    if (!this.isGrounded || this.reboundWindowTimer <= 0) return null;
+    const peek = this.tryPeekBufferedSwipe();
+    if (!peek) return null;
+    const up01 = inverseLerp(UP_SWIPE_THRESHOLD, UP_SWIPE_THRESHOLD * 3.4, peek.svy);
+    if (up01 <= 0) return null;
+    const timing01 = 1 - clamp(this.bufferedSwipeAge / SWIPE_BUFFER_LIFETIME, 0, 1);
+    const str = clamp(up01 * 0.72 + peek.strength * 0.18 + timing01 * 0.2, 0, 1);
+    const nextEnergy = clamp(Math.max(MIN_ENERGY, this.bounceEnergy01 * 0.92 + str * ENERGY_GAIN), 0, 1);
+    const bvy = lerp(REBOUND_MIN_Y, REBOUND_MAX_Y, nextEnergy);
+    const si = buildSwipeImpulse(peek.svx, peek.svy, GROUND_SWIPE_X_IMP, GROUND_SWIPE_Y_IMP);
+    const applied = applySwipeForce(BASE_FORWARD_X, bvy, si.x, si.y, true);
+    const vel = clampLaunchVel(applied.x, applied.y);
+    if (consume) {
+      this.bounceEnergy01 = nextEnergy;
+      this.consumeBufferedSwipe();
+    }
+    return { vx: vel.x, vy: vel.y, strength: str };
+  };
+
+  ctrl.launch = function(vx, vy) {
+    this.posY += 0.02;
+    this.velX = vx; this.velY = vy;
+    this.isGrounded = false; this.isCompressing = false; this.isDiving = false;
+    this.reboundWindowTimer = 0;
+    this.consumeBufferedSwipe();
+  };
+
+  ctrl.tickGrounded = function(dt, input) {
+    this.velX = 0; this.velY = 0;
+    this.isDiving = false;
+    this.reboundWindowTimer = Math.max(0, this.reboundWindowTimer - dt);
+    const rebound = this.tryBuildReboundVelocity(true);
+    if (rebound) { this.launch(rebound.vx, rebound.vy); return; }
+    if (input.started) {
+      this.isCompressing = true; this.compression01 = 0;
+      this.pointerAnchorX = input.screenX; this.pointerAnchorY = input.screenY;
+      this.pointerPosX = input.screenX; this.pointerPosY = input.screenY;
+    } else if (!this.isCompressing && input.held && this.reboundWindowTimer <= 0) {
+      this.isCompressing = true; this.compression01 = 0;
+      this.pointerAnchorX = input.screenX; this.pointerAnchorY = input.screenY;
+      this.pointerPosX = input.screenX; this.pointerPosY = input.screenY;
+    }
+    if (!this.isCompressing) return;
+    if (input.held) {
+      this.pointerPosX = input.screenX; this.pointerPosY = input.screenY;
+      this.compression01 = evaluateCompression(this.pointerAnchorX, this.pointerAnchorY, this.pointerPosX, this.pointerPosY);
+      return;
+    }
+    if (!input.released) return;
+    this.pointerPosX = input.screenX; this.pointerPosY = input.screenY;
+    const cv = this.buildCompressionVelocity();
+    this.isCompressing = false; this.compression01 = 0;
+    if (cv.strength <= 0) return;
+    this.bounceEnergy01 = clamp(Math.max(ENERGY_SEED, this.bounceEnergy01 * 0.88 + cv.strength * 0.18), 0, 1);
+    this.launch(cv.vx, cv.vy);
+  };
+
+  ctrl.applyAirSwipeImpulse = function() {
+    let dive01 = 0;
+    const peek = this.tryPeekBufferedSwipe();
+    if (!peek) return dive01;
+    this.consumeBufferedSwipe();
+    const si = buildSwipeImpulse(peek.svx, peek.svy, AIR_SWIPE_X_IMP, AIR_SWIPE_Y_IMP);
+    if (si.x * si.x + si.y * si.y <= 0.0001) return dive01;
+    if (si.y < 0 && this.velY > 0) {
+      dive01 = inverseLerp(0.2, AIR_SWIPE_Y_IMP, -si.y);
+    }
+    const applied = applySwipeForce(this.velX, this.velY, si.x, si.y, false);
+    this.velX = applied.x; this.velY = applied.y;
+    return dive01;
+  };
+
+  ctrl.tickAirborne = function(dt) {
+    this.isCompressing = false; this.compression01 = 0;
+    const prevX = this.posX, prevY = this.posY;
+    const dive01 = this.applyAirSwipeImpulse();
+    this.isDiving = dive01 > 0.02;
+    const gs = lerp(1, DIVE_GRAVITY_MUL, dive01);
+    this.velY -= GRAVITY * gs * dt;
+    this.posX += this.velX * dt;
+    this.posY += this.velY * dt;
+    if (this.velY > 0) return;
+    const landing = findLandingPlatform(prevX, prevY, this.posX, this.posY);
+    if (!landing) return;
+
+    // Store landing info before snapping position
+    this.lastLandingVelY = Math.abs(this.velY);
+    this.lastLandingOffsetX = Math.abs(this.posX - platforms[landing.index].x);
+    this.lastLandingPlatWidth = platforms[landing.index].width;
+    this.justLanded = true;
+
+    this.posX = landing.x; this.posY = landing.y;
+    this.velX = 0; this.velY = 0;
+    this.currentPlatformIndex = landing.index;
+    this.isGrounded = true; this.isDiving = false;
+    this.isCompressing = false; this.compression01 = 0;
+
+    // Platform-type-specific landing behavior
+    const landedPlatform = platforms[landing.index];
+    if (landedPlatform.type === 'spring') {
+      this.bounceEnergy01 = Math.min(1, this.bounceEnergy01 * 1.35);
+    } else {
+      this.bounceEnergy01 = Math.max(MIN_ENERGY, this.bounceEnergy01 * ENERGY_DECAY);
+    }
+    if (landedPlatform.type === 'crumble' && !landedPlatform.crumbleActive && !landedPlatform.crumbled) {
+      landedPlatform.crumbleActive = true;
+      landedPlatform.crumbleTimer = 0;
+    }
+
+    this.reboundWindowTimer = REBOUND_WINDOW_DURATION;
+    this.bufferedSwipePending = false; this.bufferedSwipeAge = 1e9;
+    const rebound = this.tryBuildReboundVelocity(true);
+    if (rebound) this.launch(rebound.vx, rebound.vy);
+  };
+
+  ctrl.tick = function(dt, input) {
+    this.updatePointer(input, dt);
+    if (this.isGrounded) { this.tickGrounded(dt, input); return; }
+    this.tickAirborne(dt);
+  };
+
+  return ctrl;
+}
+
+function findLandingPlatform(prevX, prevY, curX, curY) {
+  if (curY > prevY) return null;
+  let best = null;
+  for (let i = platforms.length - 1; i >= 0; i--) {
+    const p = platforms[i];
+    if (p.crumbled) continue;
+    const top = p.y;
+    if (top > prevY + LANDING_GRACE_Y || top < curY - LANDING_GRACE_Y) continue;
+    const t = inverseLerp(prevY, curY, top);
+    const x = lerp(prevX, curX, t);
+    if (Math.abs(x - p.x) > p.width * 0.5 + LANDING_GRACE_X) continue;
+    if (!best || p.y > best.y) best = p;
+  }
+  return best ? { index: best.index, x: best.x, y: best.y } : null;
+}
+
+// --- Moving platforms tick ---
+function tickMovingPlatforms(dt) {
+  for (const p of platforms) {
+    if (p.type === 'moving' && !p.crumbled) {
+      p.x = p.baseX + Math.sin(gameTime * p.moveSpeed + p.movePhase) * p.moveAmplitude;
+    }
+  }
+}
+
+// --- Crumble timer tick ---
+function tickCrumblePlatforms(dt) {
+  for (const p of platforms) {
+    if (p.type === 'crumble' && p.crumbleActive && !p.crumbled) {
+      p.crumbleTimer += dt;
+      if (p.crumbleTimer >= p.crumbleDuration) {
+        p.crumbled = true;
+        // If player is on this platform, they fall
+        if (playerCtrl && playerCtrl.isGrounded && playerCtrl.currentPlatformIndex === p.index) {
+          playerCtrl.isGrounded = false;
+          playerCtrl.velY = -0.5;
+        }
+        spawnParticles(p.x, p.y + 0.05, 10, '#C87830', 0.8, 0.6);
+        triggerShake(3, 0.12);
+      }
+    }
+  }
+}
+
+// --- Game State ---
+let state = 'intro'; // intro, playing, victory, defeat
+let stateTimer = 0;
+let playerCtrl = null;
+let cameraX = 0, cameraY = 0;
+let cameraAnchorX = 0, cameraAnchorY = 0;
+let highestHeight = 0;
+let cameraVelX = { v: 0 }, cameraVelY = { v: 0 };
+let overlayAlpha = 0, overlayAlphaTarget = 1;
+let overlayTitle = '', overlayBody = '', overlayHint = '';
+let gameTime = 0;
+let lastGrounded = true;
+let lastPlatformIndex = 0;
+
+// --- Viral / Modern Systems State ---
+let runTimer = 0;
+let runTimerActive = false;
+let personalBest = 0;
+let attemptCount = 0;
+let hasStarted = false;
+let newBestFlash = false;
+
+// Screen shake
+let shakeOffX = 0, shakeOffY = 0, shakeTimer = 0, shakeIntensity = 0;
+
+// Slow-mo
+let timeScale = 1.0;
+let slowMoTimer = 0;
+let cameraZoom = 1.0;
+let cameraZoomTarget = 1.0;
+let flashAlpha = 0;
+
+// Trail
+const trailDots = [];
+let trailSpawnTimer = 0;
+
+// Popups
+const popups = [];
+
+// Landing squash
+let landingSquash = 0;
+
+// Impact freeze
+let impactFreezeTimer = 0;
+
+// Platform flash
+let platformFlashIndex = -1;
+let platformFlashTimer = 0;
+
+// --- Particles ---
+const particles = [];
+function spawnParticles(wx, wy, count, color, spread, life) {
+  for (let i = 0; i < count; i++) {
+    particles.push({
+      x: wx + (Math.random() - 0.5) * spread,
+      y: wy + Math.random() * spread * 0.3,
+      vx: (Math.random() - 0.5) * 2.5,
+      vy: Math.random() * 2 + 0.5,
+      life: life * (0.6 + Math.random() * 0.4),
+      maxLife: life,
+      size: 0.04 + Math.random() * 0.06,
+      color: color,
+    });
+  }
+}
+function tickParticles(dt) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.vy -= 4 * dt;
+    p.life -= dt;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+}
+function drawParticles() {
+  for (const p of particles) {
+    const alpha = clamp(p.life / p.maxLife, 0, 1);
+    const sp = worldToScreen(p.x - p.size / 2, p.y + p.size / 2);
+    const ss = worldScale(p.size);
+    CTX.globalAlpha = alpha * 0.8;
+    CTX.fillStyle = p.color;
+    CTX.fillRect(sp.x, sp.y, ss, ss);
+  }
+  CTX.globalAlpha = 1;
+}
+
+// --- Screen Shake System ---
+function triggerShake(intensity, duration) {
+  if (intensity > shakeIntensity) {
+    shakeIntensity = intensity;
+  }
+  shakeTimer = Math.max(shakeTimer, duration);
+}
+
+function tickScreenShake(dt) {
+  if (shakeTimer > 0) {
+    shakeTimer -= dt;
+    shakeIntensity *= 0.85;
+    const dpr = window.devicePixelRatio || 1;
+    shakeOffX = (Math.random() - 0.5) * 2 * shakeIntensity * dpr;
+    shakeOffY = (Math.random() - 0.5) * 2 * shakeIntensity * dpr;
+    if (shakeTimer <= 0) {
+      shakeTimer = 0;
+      shakeIntensity = 0;
+      shakeOffX = 0;
+      shakeOffY = 0;
+    }
+  } else {
+    shakeOffX = 0;
+    shakeOffY = 0;
+  }
+}
+
+// --- Slow-Mo System ---
+function tickSlowMo(dt) {
+  if (slowMoTimer > 0) {
+    slowMoTimer -= dt;
+    if (slowMoTimer <= 0) {
+      slowMoTimer = 0;
+      timeScale = 1.0;
+      cameraZoomTarget = 1.0;
+    }
+  }
+  // Flash fade
+  if (flashAlpha > 0) {
+    flashAlpha = Math.max(0, flashAlpha - dt / 0.2);
+  }
+  // Zoom interpolation
+  cameraZoom = lerp(cameraZoom, cameraZoomTarget, Math.min(1, dt * 12));
+}
+
+function drawFlash() {
+  if (flashAlpha > 0.01) {
+    CTX.globalAlpha = flashAlpha;
+    CTX.fillStyle = '#fff';
+    CTX.fillRect(0, 0, CANVAS_W, CANVAS_H);
+    CTX.globalAlpha = 1;
+  }
+}
+
+// --- Trail System ---
+function tickTrail(dt) {
+  if (playerCtrl && !playerCtrl.isGrounded && state === 'playing') {
+    trailSpawnTimer -= dt;
+    if (trailSpawnTimer <= 0) {
+      trailSpawnTimer = 0.03;
+      trailDots.push({
+        x: playerCtrl.posX,
+        y: playerCtrl.posY + 0.4,
+        life: 0.5,
+        maxLife: 0.5,
+      });
+      if (trailDots.length > 30) trailDots.shift();
+    }
+  } else {
+    trailSpawnTimer = 0;
+  }
+  for (let i = trailDots.length - 1; i >= 0; i--) {
+    trailDots[i].life -= dt;
+    if (trailDots[i].life <= 0) trailDots.splice(i, 1);
+  }
+}
+
+function drawTrail() {
+  for (const dot of trailDots) {
+    const t = dot.life / dot.maxLife;
+    const sp = worldToScreen(dot.x, dot.y);
+    const radius = worldScale(0.04 + 0.03 * t);
+    CTX.globalAlpha = t * 0.6;
+    CTX.fillStyle = '#FDE14A';
+    CTX.beginPath();
+    CTX.arc(sp.x, sp.y, radius, 0, Math.PI * 2);
+    CTX.fill();
+  }
+  CTX.globalAlpha = 1;
+}
+
+// --- Floating Text Popups ---
+function spawnPopup(text, wx, wy, color) {
+  popups.push({
+    text: text,
+    x: wx,
+    y: wy,
+    color: color,
+    timer: 1.0,
+    maxTime: 1.0,
+  });
+}
+
+function tickPopups(dt) {
+  for (let i = popups.length - 1; i >= 0; i--) {
+    popups[i].timer -= dt;
+    popups[i].y += dt * 1.5;
+    if (popups[i].timer <= 0) popups.splice(i, 1);
+  }
+}
+
+function drawPopups() {
+  const dpr = window.devicePixelRatio || 1;
+  CTX.textAlign = 'center';
+  CTX.textBaseline = 'middle';
+  for (const p of popups) {
+    const t = p.timer / p.maxTime;
+    const sp = worldToScreen(p.x, p.y);
+    const scale = 1 + (1 - t) * 0.3;
+    CTX.globalAlpha = t;
+    CTX.font = `bold ${Math.round(18 * scale * dpr)}px "SF Pro Display", "Helvetica Neue", Arial, sans-serif`;
+    // Shadow
+    CTX.fillStyle = 'rgba(0,0,0,0.5)';
+    CTX.fillText(p.text, sp.x + 1 * dpr, sp.y + 1 * dpr);
+    // Text
+    CTX.fillStyle = p.color;
+    CTX.fillText(p.text, sp.x, sp.y);
+  }
+  CTX.globalAlpha = 1;
+  CTX.textAlign = 'left';
+  CTX.textBaseline = 'alphabetic';
+}
+
+// --- Speed Lines ---
+function drawSpeedLines() {
+  if (!playerCtrl || playerCtrl.isGrounded || state !== 'playing') return;
+  const speed = Math.sqrt(playerCtrl.velX * playerCtrl.velX + playerCtrl.velY * playerCtrl.velY);
+  const absVelY = Math.abs(playerCtrl.velY);
+  if (absVelY <= 6 && speed <= 7) return;
+
+  const intensity = clamp(Math.max(absVelY - 6, speed - 7) / 5, 0, 1);
+  const lineCount = Math.floor(4 + intensity * 4);
+  const moveAngle = Math.atan2(-playerCtrl.velY, -playerCtrl.velX);
+
+  CTX.lineWidth = 2 * (window.devicePixelRatio || 1);
+
+  for (let i = 0; i < lineCount; i++) {
+    const angleOffset = (i / lineCount - 0.5) * 1.2 + Math.sin(gameTime * 20 + i * 2.5) * 0.2;
+    const angle = moveAngle + angleOffset;
+    const dist = 0.15 + ((i * 7 + Math.floor(gameTime * 60)) % 11) * 0.01;
+    const len = 0.08 + intensity * 0.06;
+    const cx = CANVAS_W * 0.5;
+    const cy = CANVAS_H * 0.5;
+    const startX = cx + Math.cos(angle) * CANVAS_H * dist;
+    const startY = cy + Math.sin(angle) * CANVAS_H * dist;
+    const endX = startX + Math.cos(angle) * CANVAS_H * len;
+    const endY = startY + Math.sin(angle) * CANVAS_H * len;
+
+    CTX.globalAlpha = intensity * 0.25 * (0.5 + ((i * 3 + Math.floor(gameTime * 30)) % 7) * 0.07);
+    CTX.strokeStyle = '#fff';
+    CTX.beginPath();
+    CTX.moveTo(startX, startY);
+    CTX.lineTo(endX, endY);
+    CTX.stroke();
+  }
+  CTX.globalAlpha = 1;
+}
+
+// --- Format Time Helper ---
+function formatTime(seconds) {
+  const mins = Math.floor(seconds / 60);
+  const secs = Math.floor(seconds % 60);
+  const ms = Math.floor((seconds % 1) * 100);
+  return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}.${String(ms).padStart(2, '0')}`;
+}
+
+// --- Vignette ---
+function drawVignette() {
+  const grd = CTX.createRadialGradient(
+    CANVAS_W * 0.45, CANVAS_H * 0.4, CANVAS_H * 0.2,
+    CANVAS_W * 0.45, CANVAS_H * 0.4, CANVAS_H * 0.65
+  );
+  grd.addColorStop(0, 'rgba(0,0,0,0)');
+  grd.addColorStop(0.7, 'rgba(0,0,0,0.15)');
+  grd.addColorStop(1, 'rgba(0,0,0,0.5)');
+  CTX.fillStyle = grd;
+  CTX.fillRect(0, 0, CANVAS_W, CANVAS_H);
+}
+
+// --- Input State ---
+const inputState = {
+  held: false, started: false, released: false,
+  screenX: 0, screenY: 0,
+  restart: false,
+  simSwipeX: 0, simSwipeY: 0,
+  keysDown: {},
+};
+
+function setupInput() {
+  // Keyboard
+  window.addEventListener('keydown', e => {
+    inputState.keysDown[e.code] = true;
+    if (e.code === 'KeyR' || e.code === 'Enter') inputState.restart = true;
+  });
+  window.addEventListener('keyup', e => {
+    inputState.keysDown[e.code] = false;
+  });
+
+  // Pointer (mouse + touch unified)
+  let pointerDown = false;
+  CANVAS.addEventListener('pointerdown', e => {
+    e.preventDefault();
+    if (state === 'playing') {
+      pointerDown = true;
+      inputState.started = true;
+      inputState.held = true;
+      inputState.screenX = e.offsetX;
+      inputState.screenY = e.offsetY;
+    }
+    if (state === 'victory' || state === 'defeat') {
+      inputState.restart = true;
+    }
+  });
+  window.addEventListener('pointermove', e => {
+    if (pointerDown && state === 'playing') {
+      const rect = CANVAS.getBoundingClientRect();
+      inputState.screenX = e.clientX - rect.left;
+      inputState.screenY = e.clientY - rect.top;
+      inputState.held = true;
+    }
+  });
+  window.addEventListener('pointerup', e => {
+    if (pointerDown) {
+      pointerDown = false;
+      const rect = CANVAS.getBoundingClientRect();
+      inputState.screenX = e.clientX - rect.left;
+      inputState.screenY = e.clientY - rect.top;
+      inputState.released = true;
+      inputState.held = false;
+    }
+  });
+}
+
+function sampleInput() {
+  const keys = inputState.keysDown;
+  let simX = 0, simY = 0;
+  if (state === 'playing') {
+    if (keys['ArrowLeft']) simX -= 1100;
+    if (keys['ArrowRight']) simX += 1100;
+    if (keys['ArrowUp']) simY += 1300;
+    if (keys['ArrowDown']) simY -= 1300;
+  }
+  const frame = {
+    held: inputState.held,
+    started: inputState.started,
+    released: inputState.released,
+    screenX: inputState.screenX,
+    screenY: inputState.screenY,
+    restart: inputState.restart,
+    simSwipeX: simX,
+    simSwipeY: simY,
+  };
+  // Clear one-shot flags
+  inputState.started = false;
+  inputState.released = false;
+  inputState.restart = false;
+  return frame;
+}
+
+// --- Camera ---
+function getScreenAnchoredCameraTarget(focusX, focusY, screenFracX, screenFracY) {
+  const aspect = CANVAS_W / CANVAS_H;
+  const halfH = CAMERA_SIZE;
+  const halfW = halfH * aspect;
+  const offX = halfW * (1 - screenFracX * 2);
+  const offY = halfH * (1 - screenFracY * 2);
+  return { x: focusX + offX, y: focusY + offY };
+}
+
+function tickCamera(dt) {
+  let target;
+  if (state === 'intro') {
+    target = getScreenAnchoredCameraTarget(cameraAnchorX, cameraAnchorY + INTRO_CAMERA_EXTRA_Y, CAMERA_FOCUS_X, CAMERA_FOCUS_Y);
+  } else if (state === 'victory') {
+    const last = platforms[platforms.length - 1];
+    target = getScreenAnchoredCameraTarget(last.x + 0.2, last.y + 0.55, VICTORY_CAMERA_FOCUS_X, VICTORY_CAMERA_FOCUS_Y);
+  } else if (state === 'defeat') {
+    target = getScreenAnchoredCameraTarget(cameraAnchorX, cameraAnchorY + DEFEAT_CAMERA_DROP, DEFEAT_CAMERA_FOCUS_X, DEFEAT_CAMERA_FOCUS_Y);
+  } else {
+    // Playing state: blend camera toward player when airborne
+    let focusX = cameraAnchorX;
+    let focusY = cameraAnchorY;
+    if (playerCtrl && !playerCtrl.isGrounded) {
+      focusY = lerp(cameraAnchorY, playerCtrl.posY, 0.35);
+      focusX = lerp(cameraAnchorX, playerCtrl.posX, 0.25);
+    }
+    target = getScreenAnchoredCameraTarget(focusX, focusY, CAMERA_FOCUS_X, CAMERA_FOCUS_Y);
+  }
+  // Orbit sway
+  const phase = cameraAnchorY * CAMERA_ORBIT_FREQ;
+  let ox = Math.sin(phase) * CAMERA_ORBIT_X;
+  let oy = Math.cos(phase * 0.5 + 0.6) * CAMERA_ORBIT_Y;
+  if (state === 'victory') { ox *= 0.85; oy *= 0.85; }
+  else if (state === 'defeat') { ox *= 0.65; oy *= 0.65; }
+  target.x += ox; target.y += oy;
+  const smooth = state === 'playing' ? CAMERA_SMOOTH : CAMERA_SMOOTH_CINE;
+  cameraX = smoothDamp(cameraX, target.x, cameraVelX, smooth, Math.max(0.0001, dt));
+  cameraY = smoothDamp(cameraY, target.y, cameraVelY, smooth, Math.max(0.0001, dt));
+}
+
+// --- Coordinate transform (with shake + zoom) ---
+function worldToScreen(wx, wy) {
+  const aspect = CANVAS_W / CANVAS_H;
+  const halfH = CAMERA_SIZE / cameraZoom;
+  const halfW = halfH * aspect;
+  const sx = (wx - cameraX + halfW) / (2 * halfW) * CANVAS_W + shakeOffX;
+  const sy = (1 - (wy - cameraY + halfH) / (2 * halfH)) * CANVAS_H + shakeOffY;
+  return { x: sx, y: sy };
+}
+
+function worldScale(worldSize) {
+  const aspect = CANVAS_W / CANVAS_H;
+  const halfW = (CAMERA_SIZE / cameraZoom) * aspect;
+  return worldSize / (2 * halfW) * CANVAS_W;
+}
+
+// --- Rendering ---
+function getBrickTileIndex(cellX, cellY) {
+  let hash = cellX * 73856093 ^ cellY * 19349663 ^ RANDOM_SEED;
+  hash = Math.abs(hash);
+  return hash % TOTAL_BRICKS;
+}
+
+function bgCenterX(worldY) {
+  if (platforms.length === 0) return 0;
+  if (worldY <= platforms[0].y) return platforms[0].x + 0.2;
+  for (let i = 0; i < platforms.length - 1; i++) {
+    if (worldY > platforms[i + 1].y) continue;
+    return lerp(platforms[i].x, platforms[i + 1].x, inverseLerp(platforms[i].y, platforms[i + 1].y, worldY)) + 0.2;
+  }
+  return platforms[platforms.length - 1].x + 0.2;
+}
+
+function drawBackground() {
+  const aspect = CANVAS_W / CANVAS_H;
+  const viewH = CAMERA_SIZE * 2;
+  const viewW = viewH * aspect;
+  const brickScale = 0.25;
+  const cellW = 4.8 * brickScale;
+  const cellH = 1.8 * brickScale;
+
+  const minWorldX = cameraX - viewW * 0.5 - cellW * 2;
+  const maxWorldX = cameraX + viewW * 0.5 + cellW * 2;
+  const minWorldY = cameraY - viewH * 0.5 - cellH * 2;
+  const maxWorldY = cameraY + viewH * 0.5 + cellH * 2;
+  const minCellX = Math.floor(minWorldX / cellW) - 1;
+  const maxCellX = Math.ceil(maxWorldX / cellW) + 1;
+  const minCellY = Math.floor(minWorldY / cellH) - 1;
+  const maxCellY = Math.ceil(maxWorldY / cellH) + 1;
+  const coverageW = Math.max(viewW * 2.38, 14.8);
+
+  for (let cy = minCellY; cy <= maxCellY; cy++) {
+    const wc = bgCenterX((cy + 0.5) * cellH);
+    for (let cx = minCellX; cx <= maxCellX; cx++) {
+      const wx = (cx + 0.5) * cellW;
+      const normX = Math.abs(wx - wc) / (coverageW * 0.5);
+      if (normX > 1.28) continue;
+      const worldPosX = cx * cellW;
+      const worldPosY = cy * cellH;
+      const sp = worldToScreen(worldPosX, worldPosY + cellH);
+      const sw = worldScale(cellW);
+      const sh = worldScale(cellH);
+      const tileIdx = getBrickTileIndex(cx, cy);
+      const brightness = lerp(0.75, 1.0, 1 - clamp(normX, 0, 1));
+
+      // Fog: gentle darkening at bottom
+      const fogBottom = cameraY - viewH * 0.7;
+      const fogTop = cameraY + viewH * 0.6;
+      const fogT = inverseLerp(fogBottom, fogTop, (cy + 0.5) * cellH);
+      const fogDark = clamp((1 - fogT) * 0.35, 0, 0.5);
+
+      CTX.globalAlpha = 1;
+      if (bricksLoaded >= TOTAL_BRICKS) {
+        CTX.drawImage(BRICK_IMAGES[tileIdx], sp.x, sp.y, sw + 0.5, sh + 0.5);
+      } else {
+        // Fallback: visible colored bricks
+        const br = lerp(0.18, 0.28, brightness);
+        CTX.fillStyle = `rgb(${Math.floor(br*220)},${Math.floor(br*210)},${Math.floor(br*200)})`;
+        CTX.fillRect(sp.x, sp.y, sw + 1, sh + 1);
+        // Brick border
+        CTX.strokeStyle = `rgba(0,0,0,0.3)`;
+        CTX.lineWidth = 1;
+        CTX.strokeRect(sp.x + 0.5, sp.y + 0.5, sw, sh);
+      }
+
+      // Mild edge + fog darkening
+      const edgeDark = (1 - brightness) * 0.15;
+      const totalDark = clamp(edgeDark + fogDark, 0, 0.6);
+      if (totalDark > 0.02) {
+        CTX.globalAlpha = totalDark;
+        CTX.fillStyle = '#030408';
+        CTX.fillRect(sp.x, sp.y, sw + 0.5, sh + 0.5);
+      }
+    }
+  }
+  CTX.globalAlpha = 1;
+}
+
+function getPlatformColors(type, depthFade) {
+  switch (type) {
+    case 'spring':
+      return {
+        top: lerpColor([0.18, 0.52, 0.18], [0.35, 0.82, 0.30], depthFade),
+        edge: null,
+      };
+    case 'crumble':
+      return {
+        top: lerpColor([0.58, 0.34, 0.12], [0.90, 0.55, 0.20], depthFade),
+        edge: null,
+      };
+    case 'moving':
+      return {
+        top: lerpColor([0.18, 0.30, 0.58], [0.35, 0.55, 0.90], depthFade),
+        edge: null,
+      };
+    default:
+      return {
+        top: lerpColor([0.42, 0.28, 0.14], [0.78, 0.54, 0.28], depthFade),
+        edge: null,
+      };
+  }
+}
+
+function drawPlatforms() {
+  for (const p of platforms) {
+    if (p.crumbled) continue;
+
+    const depthFade = inverseLerp(cameraY - CAMERA_SIZE, cameraY + CAMERA_SIZE * 0.9, p.y);
+
+    // Crumble shake offset
+    let platShakeX = 0, platShakeY = 0;
+    if (p.type === 'crumble' && p.crumbleActive) {
+      const intensity = clamp(p.crumbleTimer / p.crumbleDuration, 0, 1);
+      platShakeX = (Math.sin(gameTime * 45) * 0.03 + Math.cos(gameTime * 63) * 0.02) * intensity;
+      platShakeY = (Math.cos(gameTime * 52) * 0.02) * intensity;
+    }
+
+    const drawX = p.x + platShakeX;
+    const drawY = p.y + platShakeY;
+
+    // Shadow (slightly below and wider)
+    const shadowW = p.width * 1.08;
+    const shadowTh = p.thickness * 1.55;
+    const ss = worldToScreen(drawX - shadowW / 2, drawY + 0.1);
+    CTX.globalAlpha = lerp(0.15, 0.3, depthFade);
+    CTX.fillStyle = '#000';
+    CTX.fillRect(ss.x, ss.y, worldScale(shadowW), worldScale(shadowTh));
+
+    // Edge (darker, below plank surface)
+    const colors = getPlatformColors(p.type, depthFade);
+    const topColor = colors.top;
+    const edgeTh = Math.max(p.thickness * 1.8, 0.18);
+    const ep = worldToScreen(drawX - p.width * 0.49, drawY);
+    const edgeColor = [Math.floor(topColor[0] * 0.55), Math.floor(topColor[1] * 0.55), Math.floor(topColor[2] * 0.55)];
+    CTX.globalAlpha = 1;
+
+    // Crumble fade
+    if (p.type === 'crumble' && p.crumbleActive) {
+      CTX.globalAlpha = 1 - clamp(p.crumbleTimer / p.crumbleDuration, 0, 1) * 0.4;
+    }
+
+    CTX.fillStyle = `rgb(${edgeColor[0]},${edgeColor[1]},${edgeColor[2]})`;
+    CTX.fillRect(ep.x, ep.y, worldScale(p.width * 0.98), worldScale(edgeTh));
+
+    // Plank top surface
+    const plankTh = Math.max(p.thickness, 0.1);
+    const sp = worldToScreen(drawX - p.width / 2, drawY + plankTh);
+    CTX.fillStyle = `rgb(${topColor[0]},${topColor[1]},${topColor[2]})`;
+    CTX.fillRect(sp.x, sp.y, worldScale(p.width), worldScale(plankTh));
+
+    // Landing flash on platform
+    if (platformFlashIndex === p.index && platformFlashTimer > 0) {
+      CTX.globalAlpha = clamp(platformFlashTimer / 0.15, 0, 1) * 0.5;
+      CTX.fillStyle = '#fff';
+      CTX.fillRect(sp.x, sp.y, worldScale(p.width), worldScale(plankTh));
+    }
+
+    // Highlight line on top
+    CTX.globalAlpha = 0.25;
+    const hl = worldToScreen(drawX - p.width * 0.48, drawY + plankTh + 0.01);
+    CTX.fillStyle = '#fff';
+    CTX.fillRect(hl.x, hl.y, worldScale(p.width * 0.96), Math.max(1, worldScale(0.02)));
+
+    // Type-specific decorations
+    CTX.globalAlpha = 1;
+    if (p.type === 'spring') {
+      // Coil decoration: 3 small arcs on top
+      const coilY = drawY + plankTh + 0.02;
+      CTX.strokeStyle = '#40E040';
+      CTX.lineWidth = Math.max(1, worldScale(0.025));
+      for (let ci = 0; ci < 3; ci++) {
+        const cx = drawX - p.width * 0.25 + ci * p.width * 0.25;
+        const csp = worldToScreen(cx, coilY + 0.06);
+        CTX.beginPath();
+        CTX.arc(csp.x, csp.y, worldScale(0.05), Math.PI, 0);
+        CTX.stroke();
+      }
+    } else if (p.type === 'crumble') {
+      // Crack decorations
+      CTX.strokeStyle = 'rgba(60,30,10,0.6)';
+      CTX.lineWidth = Math.max(1, worldScale(0.015));
+      const crackBase = worldToScreen(drawX - p.width * 0.2, drawY + plankTh * 0.5);
+      const crackEnd = worldToScreen(drawX + p.width * 0.1, drawY + plankTh * 0.2);
+      CTX.beginPath();
+      CTX.moveTo(crackBase.x, crackBase.y);
+      CTX.lineTo(crackEnd.x, crackEnd.y);
+      CTX.stroke();
+      const crack2Base = worldToScreen(drawX + p.width * 0.05, drawY + plankTh * 0.7);
+      const crack2End = worldToScreen(drawX + p.width * 0.3, drawY + plankTh * 0.3);
+      CTX.beginPath();
+      CTX.moveTo(crack2Base.x, crack2Base.y);
+      CTX.lineTo(crack2End.x, crack2End.y);
+      CTX.stroke();
+    } else if (p.type === 'moving') {
+      // Arrow decorations (left/right)
+      const arrowY = drawY + plankTh * 0.5;
+      CTX.fillStyle = 'rgba(100,160,255,0.5)';
+      const arrowSize = worldScale(0.06);
+      // Left arrow
+      const la = worldToScreen(drawX - p.width * 0.38, arrowY);
+      CTX.beginPath();
+      CTX.moveTo(la.x - arrowSize, la.y);
+      CTX.lineTo(la.x + arrowSize * 0.5, la.y - arrowSize);
+      CTX.lineTo(la.x + arrowSize * 0.5, la.y + arrowSize);
+      CTX.closePath();
+      CTX.fill();
+      // Right arrow
+      const ra = worldToScreen(drawX + p.width * 0.38, arrowY);
+      CTX.beginPath();
+      CTX.moveTo(ra.x + arrowSize, ra.y);
+      CTX.lineTo(ra.x - arrowSize * 0.5, ra.y - arrowSize);
+      CTX.lineTo(ra.x - arrowSize * 0.5, ra.y + arrowSize);
+      CTX.closePath();
+      CTX.fill();
+    }
+
+    CTX.globalAlpha = 1;
+
+    // Goal marker (princess Theresa)
+    if (p.isGoal) {
+      const bob = Math.sin(gameTime * 2.4) * 0.08;
+      const baseY = drawY + plankTh + 0.05 + bob;
+
+      // Dress (white, like the character sheets)
+      const dressW = 0.5, dressH = 0.7;
+      const dp = worldToScreen(drawX - dressW / 2, baseY + dressH);
+      CTX.fillStyle = '#E8E0D8';
+      CTX.fillRect(dp.x, dp.y, worldScale(dressW), worldScale(dressH));
+
+      // Hair (long silver/white)
+      const hairW = 0.4, hairH = 0.8;
+      const hp = worldToScreen(drawX - hairW / 2 - 0.02, baseY + 0.3 + hairH);
+      CTX.fillStyle = '#C8C4CC';
+      CTX.fillRect(hp.x, hp.y, worldScale(hairW), worldScale(hairH));
+
+      // Head / face
+      const headW = 0.36, headH = 0.32;
+      const hdp = worldToScreen(drawX - headW / 2, baseY + dressH + headH);
+      CTX.fillStyle = '#FFE4C8';
+      CTX.fillRect(hdp.x, hdp.y, worldScale(headW), worldScale(headH));
+
+      // Eyes
+      CTX.fillStyle = '#2B2D40';
+      const eyeS = worldScale(0.06);
+      const e1 = worldToScreen(drawX - 0.08, baseY + dressH + headH * 0.55);
+      const e2 = worldToScreen(drawX + 0.04, baseY + dressH + headH * 0.55);
+      CTX.fillRect(e1.x, e1.y, eyeS, eyeS);
+      CTX.fillRect(e2.x, e2.y, eyeS, eyeS);
+
+      // Crown (gold)
+      const crownW = 0.34, crownH = 0.16;
+      const cp = worldToScreen(drawX - crownW / 2, baseY + dressH + headH + crownH);
+      CTX.fillStyle = '#FAD642';
+      CTX.fillRect(cp.x, cp.y, worldScale(crownW), worldScale(crownH));
+      // Crown points
+      const ptsW = worldScale(0.06);
+      for (let ci = 0; ci < 3; ci++) {
+        const cx = drawX - crownW / 2 + crownW * (ci + 0.5) / 3;
+        const cpt = worldToScreen(cx - 0.03, baseY + dressH + headH + crownH + 0.06);
+        CTX.fillRect(cpt.x, cpt.y, ptsW, worldScale(0.06));
+      }
+
+      // Sparkle effect
+      CTX.globalAlpha = 0.4 + Math.sin(gameTime * 3) * 0.3;
+      CTX.fillStyle = '#FFF8E0';
+      for (let si = 0; si < 3; si++) {
+        const angle = gameTime * 1.5 + si * Math.PI * 2 / 3;
+        const sr = 0.6;
+        const sx = drawX + Math.cos(angle) * sr;
+        const sy = baseY + dressH * 0.5 + Math.sin(angle) * sr * 0.6;
+        const ssp = worldToScreen(sx - 0.03, sy + 0.03);
+        CTX.fillRect(ssp.x, ssp.y, worldScale(0.06), worldScale(0.06));
+      }
+      CTX.globalAlpha = 1;
+    }
+  }
+  CTX.globalAlpha = 1;
+}
+
+function lerpColor(a, b, t) {
+  return [
+    Math.floor(lerp(a[0], b[0], t) * 255),
+    Math.floor(lerp(a[1], b[1], t) * 255),
+    Math.floor(lerp(a[2], b[2], t) * 255),
+  ];
+}
+
+function drawPlayer() {
+  if (!playerCtrl) return;
+  const px = playerCtrl.posX, py = playerCtrl.posY;
+  const compression = playerCtrl.isCompressing ? playerCtrl.compression01 : 0;
+  const stretch = !playerCtrl.isGrounded ? clamp(Math.abs(playerCtrl.velY) / 9, 0, 1) : 0;
+  const lean = playerCtrl.isGrounded
+    ? playerCtrl.isCompressing
+      ? lerp(-18, 10, compression)
+      : -4
+    : clamp(playerCtrl.velY * 2.4, -30, 18);
+  const hop = playerCtrl.isGrounded ? Math.sin(gameTime * 5) * 0.02 : 0;
+
+  // Landing squash factor
+  const sq = landingSquash;
+
+  // Shadow on ground
+  const shadowW = lerp(0.52, 0.68, compression) * (1 + sq * 0.15);
+  const shadowH = lerp(0.16, 0.1, compression);
+  const shp = worldToScreen(px - shadowW / 2, py + shadowH * 0.3);
+  CTX.globalAlpha = 0.25;
+  CTX.fillStyle = '#000';
+  drawEllipse(CTX, shp.x, shp.y, worldScale(shadowW), worldScale(shadowH));
+  CTX.globalAlpha = 1;
+
+  // Body pivot offset
+  const pivotY = 0.82 - compression * 0.08 + hop - sq * 0.05;
+
+  CTX.save();
+  const pivotScreen = worldToScreen(px, py + pivotY);
+  CTX.translate(pivotScreen.x, pivotScreen.y);
+  CTX.rotate(-lean * Math.PI / 180);
+
+  const s = (v) => worldScale(v); // shorthand
+
+  // --- Duck Knight pixel-art style ---
+  // Feet (orange)
+  CTX.fillStyle = '#E88820';
+  CTX.fillRect(s(-0.18), s(0.08), s(0.14), s(0.08));
+  CTX.fillRect(s(0.04), s(0.08), s(0.14), s(0.08));
+  // Foot fronts
+  CTX.fillRect(s(-0.22), s(0.12), s(0.08), s(0.04));
+  CTX.fillRect(s(0.08), s(0.12), s(0.08), s(0.04));
+
+  // Body (yellow duck - round-ish) with landing squash
+  const bodyW = 0.56 * lerp(1, 1.18, compression) * (1 + sq * 0.25);
+  const bodyH = 0.6 * lerp(1, 0.72, compression) * lerp(1, 1.08, stretch) * (1 - sq * 0.25);
+  CTX.fillStyle = '#FDE14A';
+  CTX.fillRect(s(-bodyW / 2), s(-bodyH / 2 - 0.08), s(bodyW), s(bodyH));
+  // Body highlight
+  CTX.fillStyle = '#FFF06A';
+  CTX.fillRect(s(-bodyW / 2 + 0.04), s(-bodyH / 2 - 0.04), s(bodyW * 0.4), s(bodyH * 0.3));
+  // Body darker underside
+  CTX.fillStyle = '#E8C830';
+  CTX.fillRect(s(-bodyW / 2 + 0.02), s(0.02), s(bodyW - 0.04), s(bodyH * 0.2));
+
+  // Tail (small bump on back)
+  CTX.fillStyle = '#FDE14A';
+  CTX.fillRect(s(-bodyW / 2 - 0.06), s(-0.12), s(0.1), s(0.1));
+
+  // Wing
+  CTX.fillStyle = '#E8C830';
+  CTX.fillRect(s(-bodyW / 2 + 0.02), s(-0.18), s(0.12), s(0.24));
+
+  // Helmet (gray metallic) with squash
+  const helmY = 0.38 - compression * 0.08;
+  const helmW = 0.56 * lerp(1, 1.08, compression) * (1 + sq * 0.15);
+  const helmH = 0.28 * lerp(1, 0.82, compression) * (1 - sq * 0.15);
+  CTX.fillStyle = '#8A8E9A';
+  CTX.fillRect(s(-helmW / 2), s(-helmY - helmH / 2), s(helmW), s(helmH));
+  // Helmet highlight
+  CTX.fillStyle = '#B0B4C0';
+  CTX.fillRect(s(-helmW / 2 + 0.02), s(-helmY - helmH / 2 + 0.02), s(helmW * 0.6), s(helmH * 0.3));
+  // Helmet crest
+  CTX.fillStyle = '#D04040';
+  CTX.fillRect(s(-0.04), s(-helmY - helmH / 2 - 0.06), s(0.08), s(0.08));
+
+  // Visor (dark slit)
+  CTX.fillStyle = '#1A1E28';
+  CTX.fillRect(s(0.02), s(-0.26), s(0.22), s(0.1));
+  // Visor reflection
+  CTX.fillStyle = 'rgba(120,160,220,0.3)';
+  CTX.fillRect(s(0.04), s(-0.25), s(0.06), s(0.04));
+
+  // Beak (orange, poking out)
+  CTX.fillStyle = '#FA9424';
+  CTX.fillRect(s(0.22), s(-0.22), s(0.16), s(0.10));
+  CTX.fillStyle = '#E07818';
+  CTX.fillRect(s(0.22), s(-0.16), s(0.14), s(0.04));
+
+  // Eye (visible through visor gap)
+  CTX.fillStyle = '#fff';
+  CTX.fillRect(s(0.08), s(-0.32), s(0.10), s(0.08));
+  CTX.fillStyle = '#111';
+  CTX.fillRect(s(0.12), s(-0.30), s(0.05), s(0.05));
+
+  CTX.restore();
+
+  // Compression indicator (visual feedback)
+  if (playerCtrl.isCompressing && compression > 0.05) {
+    const barW = 0.6;
+    const bp = worldToScreen(px - barW / 2, py - 0.15);
+    CTX.fillStyle = 'rgba(255,255,255,0.15)';
+    CTX.fillRect(bp.x, bp.y, s(barW), s(0.06));
+    CTX.fillStyle = lerp(0, 1, compression) > 0.7 ? '#FF6040' : '#FDE14A';
+    CTX.fillRect(bp.x, bp.y, s(barW * compression), s(0.06));
+  }
+}
+
+// --- Trajectory Preview (Aim Dots) ---
+function drawTrajectoryPreview() {
+  if (!playerCtrl || !playerCtrl.isCompressing || playerCtrl.compression01 <= 0.05) return;
+  const cv = playerCtrl.buildCompressionVelocity();
+  if (cv.strength <= 0) return;
+  let sx = playerCtrl.posX, sy = playerCtrl.posY + 0.02;
+  let vx = cv.vx, vy = cv.vy;
+  const stepDt = 0.04;
+  const numDots = 12;
+  const launchY = playerCtrl.posY;
+  for (let i = 0; i < numDots; i++) {
+    vy -= GRAVITY * stepDt;
+    sx += vx * stepDt;
+    sy += vy * stepDt;
+    if (sy < launchY - 0.5) break;
+    const sp = worldToScreen(sx, sy);
+    if (sp.x < 0 || sp.x > CANVAS_W || sp.y < 0 || sp.y > CANVAS_H) break;
+    const t = i / numDots;
+    const alpha = lerp(0.7, 0.1, t);
+    const radius = lerp(3.5, 2, t);
+    CTX.globalAlpha = alpha;
+    CTX.fillStyle = '#FFF4C8';
+    CTX.beginPath();
+    CTX.arc(sp.x, sp.y, radius, 0, Math.PI * 2);
+    CTX.fill();
+  }
+  CTX.globalAlpha = 1;
+}
+
+function drawHud(dt) {
+  const progress = inverseLerp(platforms[0].y, platforms[platforms.length - 1].y, highestHeight);
+  const dpr = window.devicePixelRatio || 1;
+  const fs = (size) => Math.round(size * dpr) + 'px';
+
+  // Top bar
+  const barH = Math.round(70 * dpr);
+  CTX.fillStyle = 'rgba(15,10,6,0.88)';
+  roundRect(CTX, 0, 0, CANVAS_W, barH, 0);
+  CTX.fill();
+
+  // Timer - top center, big and bold
+  CTX.textAlign = 'center';
+  CTX.textBaseline = 'top';
+  CTX.font = `bold ${fs(26)} "SF Mono", "Courier New", monospace`;
+  CTX.fillStyle = '#fff';
+  CTX.fillText(formatTime(runTimer), CANVAS_W / 2, 6 * dpr);
+
+  // Personal Best below timer
+  if (personalBest > 0) {
+    CTX.font = `${fs(11)} "SF Mono", "Courier New", monospace`;
+    CTX.fillStyle = '#888';
+    CTX.fillText(`PB ${formatTime(personalBest)}`, CANVAS_W / 2, 36 * dpr);
+  }
+
+  // Attempt counter - top right, subtle
+  CTX.textAlign = 'right';
+  CTX.font = `${fs(11)} "SF Pro Display", "Helvetica Neue", "Segoe UI", Arial, sans-serif`;
+  CTX.fillStyle = '#666';
+  if (attemptCount > 0) {
+    CTX.fillText(`#${attemptCount}`, CANVAS_W - 12 * dpr, 8 * dpr);
+  }
+
+  // Height/progress - top right
+  CTX.font = `bold ${fs(12)} "SF Pro Display", "Helvetica Neue", "Segoe UI", Arial, sans-serif`;
+  CTX.fillStyle = '#bbb';
+  CTX.fillText(`${Math.floor(progress * 100)}%`, CANVAS_W - 12 * dpr, 24 * dpr);
+
+  // Status text - top left
+  let statusStr = '';
+  if (state === 'intro') statusStr = 'Ready';
+  else if (state === 'playing' && playerCtrl) {
+    if (playerCtrl.isGrounded && playerCtrl.isCompressing) statusStr = `Press ${Math.floor(playerCtrl.compression01 * 100)}%`;
+    else if (playerCtrl.isGrounded && playerCtrl.reboundWindow01() > 0) statusStr = 'Rebound';
+    else if (!playerCtrl.isGrounded && playerCtrl.isDiving) statusStr = 'Dive';
+    else if (!playerCtrl.isGrounded && playerCtrl.velY > 0) statusStr = 'Rise';
+    else if (!playerCtrl.isGrounded) statusStr = 'Fall';
+    else statusStr = 'Ready';
+  } else if (state === 'victory') statusStr = 'Victory';
+  else if (state === 'defeat') statusStr = 'Retry';
+
+  CTX.textAlign = 'left';
+  CTX.font = `bold ${fs(13)} "SF Pro Display", "Helvetica Neue", "Segoe UI", Arial, sans-serif`;
+  CTX.fillStyle = '#bbb';
+  CTX.fillText(statusStr, 12 * dpr, 8 * dpr);
+
+  // Title
+  CTX.font = `${fs(10)} "SF Pro Display", "Helvetica Neue", "Segoe UI", Arial, sans-serif`;
+  CTX.fillStyle = '#666';
+  CTX.fillText('Tower Rescue', 12 * dpr, 28 * dpr);
+
+  // Energy bar
+  if (state === 'playing' && playerCtrl) {
+    const barX = 12 * dpr, barY = Math.round(48 * dpr), barW = Math.round(80 * dpr), barBH = Math.round(4 * dpr);
+    CTX.fillStyle = 'rgba(255,255,255,0.1)';
+    CTX.fillRect(barX, barY, barW, barBH);
+    const energyColor = playerCtrl.bounceEnergy01 > 0.6 ? '#80FF60' : '#FDE14A';
+    CTX.fillStyle = energyColor;
+    CTX.fillRect(barX, barY, barW * playerCtrl.bounceEnergy01, barBH);
+  }
+
+  // Overlay
+  overlayAlpha = clamp(overlayAlpha + (overlayAlphaTarget > overlayAlpha ? 1 : -1) * dt * OVERLAY_FADE, 0, 1);
+  if (overlayAlpha > 0.01) {
+    CTX.globalAlpha = overlayAlpha;
+    const ox = CANVAS_W * 0.06, oy = CANVAS_H * 0.30;
+    const ow = CANVAS_W * 0.88, oh = CANVAS_H * 0.36;
+    CTX.fillStyle = 'rgba(5,4,3,0.82)';
+    roundRect(CTX, ox, oy, ow, oh, 12 * dpr);
+    CTX.fill();
+
+    // Border
+    CTX.strokeStyle = 'rgba(253,225,74,0.2)';
+    CTX.lineWidth = 2 * dpr;
+    roundRect(CTX, ox, oy, ow, oh, 12 * dpr);
+    CTX.stroke();
+
+    CTX.fillStyle = '#FDE14A';
+    CTX.textAlign = 'center';
+    CTX.font = `bold ${fs(24)} "SF Pro Display", "Helvetica Neue", "Segoe UI", Arial, sans-serif`;
+    CTX.fillText(overlayTitle, CANVAS_W / 2, oy + 36 * dpr);
+    CTX.fillStyle = '#ddd';
+    CTX.font = `${fs(13)} "SF Pro Display", "Helvetica Neue", "Segoe UI", Arial, sans-serif`;
+    wrapText(CTX, overlayBody, CANVAS_W / 2, oy + 70 * dpr, ow - 40 * dpr, 18 * dpr);
+
+    // NEW BEST flash (pulsing gold text)
+    if (newBestFlash && state === 'victory') {
+      const pulse = 0.7 + Math.sin(gameTime * 8) * 0.3;
+      CTX.globalAlpha = overlayAlpha * pulse;
+      CTX.font = `bold ${fs(20)} "SF Pro Display", "Helvetica Neue", "Segoe UI", Arial, sans-serif`;
+      CTX.fillStyle = '#FFD700';
+      CTX.fillText('NEW BEST!', CANVAS_W / 2, oy + oh - 56 * dpr);
+    }
+
+    CTX.globalAlpha = overlayAlpha;
+    CTX.font = `${fs(11)} "SF Pro Display", "Helvetica Neue", "Segoe UI", Arial, sans-serif`;
+    CTX.fillStyle = '#888';
+    CTX.fillText(overlayHint, CANVAS_W / 2, oy + oh - 20 * dpr);
+    CTX.textAlign = 'left';
+    CTX.globalAlpha = 1;
+  }
+
+  // Platform numbers (subtle, for context)
+  if (state === 'playing') {
+    CTX.font = `bold ${fs(9)} monospace`;
+    CTX.textAlign = 'center';
+    CTX.globalAlpha = 0.35;
+    for (const p of platforms) {
+      if (p.crumbled) continue;
+      const lp = worldToScreen(p.x, p.y + 0.35);
+      if (lp.x > -50 && lp.x < CANVAS_W + 50 && lp.y > -50 && lp.y < CANVAS_H + 50) {
+        CTX.fillStyle = p.isGoal ? '#FAD642' : '#aaa';
+        CTX.fillText(p.isGoal ? 'GOAL' : `${p.index + 1}`, lp.x, lp.y);
+      }
+    }
+    CTX.globalAlpha = 1;
+    CTX.textAlign = 'left';
+  }
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+}
+
+function drawEllipse(ctx, x, y, w, h) {
+  ctx.beginPath();
+  ctx.ellipse(x + w / 2, y + h / 2, w / 2, h / 2, 0, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function wrapText(ctx, text, x, y, maxW, lineH) {
+  const words = text.split(' ');
+  let line = '';
+  for (const word of words) {
+    const test = line + word + ' ';
+    if (ctx.measureText(test).width > maxW && line.length > 0) {
+      ctx.fillText(line.trim(), x, y);
+      line = word + ' ';
+      y += lineH;
+    } else {
+      line = test;
+    }
+  }
+  ctx.fillText(line.trim(), x, y);
+}
+
+// --- Game Loop ---
+function showOverlay(title, body, hint) {
+  overlayTitle = title;
+  overlayBody = body;
+  overlayHint = hint;
+  overlayAlphaTarget = 1;
+}
+
+function restartRun() {
+  // Increment attempts (not on first load)
+  if (hasStarted) {
+    attemptCount++;
+    try { localStorage.setItem('towerRescue_attempts', String(attemptCount)); } catch(e) {}
+  }
+  hasStarted = true;
+
+  // Reset crumble/moving state on all platforms
+  for (const p of platforms) {
+    p.x = p.baseX;
+    p.crumbleTimer = 0;
+    p.crumbleActive = false;
+    p.crumbled = false;
+  }
+
+  const start = platforms[0];
+  if (!playerCtrl) playerCtrl = createBounceController();
+  state = 'intro';
+  playerCtrl.reset(start.x, start.y, 0);
+  cameraAnchorX = start.x;
+  cameraAnchorY = start.y;
+  highestHeight = start.y;
+  stateTimer = 0;
+  cameraVelX = { v: 0 };
+  cameraVelY = { v: 0 };
+  lastGrounded = true;
+  lastPlatformIndex = 0;
+  particles.length = 0;
+
+  // Reset new systems
+  runTimer = 0;
+  runTimerActive = false;
+  newBestFlash = false;
+  shakeOffX = 0; shakeOffY = 0; shakeTimer = 0; shakeIntensity = 0;
+  timeScale = 1.0; slowMoTimer = 0;
+  cameraZoom = 1.0; cameraZoomTarget = 1.0;
+  flashAlpha = 0;
+  trailDots.length = 0;
+  trailSpawnTimer = 0;
+  popups.length = 0;
+  landingSquash = 0;
+  impactFreezeTimer = 0;
+  platformFlashIndex = -1; platformFlashTimer = 0;
+
+  const introTarget = getScreenAnchoredCameraTarget(start.x, start.y + INTRO_CAMERA_EXTRA_Y, CAMERA_FOCUS_X, CAMERA_FOCUS_Y);
+  cameraX = introTarget.x;
+  cameraY = introTarget.y;
+  showOverlay(
+    'Duck Knight Begins',
+    'Hold and drag down to compress. Release to bounce. Swipe with the movement to boost.',
+    'Mouse/touch or arrow keys'
+  );
+}
+
+function resizeCanvas() {
+  const dpr = window.devicePixelRatio || 1;
+  const winW = window.innerWidth;
+  const winH = window.innerHeight;
+  const screenAspect = winW / winH;
+  let drawW, drawH;
+  if (screenAspect > TARGET_ASPECT) {
+    drawH = winH;
+    drawW = winH * TARGET_ASPECT;
+  } else {
+    drawW = winW;
+    drawH = winW / TARGET_ASPECT;
+  }
+  CANVAS.style.width = drawW + 'px';
+  CANVAS.style.height = drawH + 'px';
+  CANVAS.width = CANVAS_W = Math.floor(drawW * dpr);
+  CANVAS.height = CANVAS_H = Math.floor(drawH * dpr);
+}
+
+let lastTime = 0;
+function gameLoop(timestamp) {
+  requestAnimationFrame(gameLoop);
+  const rawDt = lastTime === 0 ? 1 / 60 : (timestamp - lastTime) / 1000;
+  lastTime = timestamp;
+  const dt = Math.min(rawDt, MAX_DT);
+
+  // Tick slow-mo and compute scaled dt
+  tickSlowMo(dt);
+  const scaledDt = dt * timeScale;
+  gameTime += scaledDt;
+
+  resizeCanvas();
+  const input = sampleInput();
+
+  // Tick screen shake (real time)
+  tickScreenShake(dt);
+
+  // State machine
+  stateTimer += dt;
+  if (state === 'intro' && stateTimer >= 0.5) {
+    state = 'playing';
+    stateTimer = 0;
+    overlayAlphaTarget = 0;
+  } else if (state === 'victory' && stateTimer >= 0.65 && input.restart) {
+    restartRun();
+  } else if (state === 'defeat' && stateTimer >= 0.3 && input.restart) {
+    restartRun();
+  }
+
+  // Run timer (real time for competitive fairness)
+  if (runTimerActive && state === 'playing') {
+    runTimer += dt;
+  }
+
+  // Platform flash decay
+  if (platformFlashTimer > 0) {
+    platformFlashTimer -= dt;
+    if (platformFlashTimer <= 0) { platformFlashTimer = 0; platformFlashIndex = -1; }
+  }
+
+  // Landing squash decay
+  if (landingSquash > 0) {
+    landingSquash *= 0.82;
+    if (landingSquash < 0.01) landingSquash = 0;
+  }
+
+  // Impact freeze
+  if (impactFreezeTimer > 0) {
+    impactFreezeTimer -= dt;
+  }
+
+  // Tick moving platforms
+  tickMovingPlatforms(scaledDt);
+
+  // Player tick
+  if (state === 'playing' && playerCtrl && impactFreezeTimer <= 0) {
+    // Track player on moving platform (before tick, so position is updated)
+    if (playerCtrl.isGrounded) {
+      const curPlat = platforms[playerCtrl.currentPlatformIndex];
+      if (curPlat.type === 'moving') {
+        playerCtrl.posX = curPlat.x;
+      }
+    }
+
+    const ctrlInput = {
+      held: input.held,
+      started: input.started,
+      released: input.released,
+      screenX: input.screenX,
+      screenY: input.screenY,
+      simSwipeX: input.simSwipeX,
+      simSwipeY: input.simSwipeY,
+    };
+    playerCtrl.tick(scaledDt, ctrlInput);
+
+    // Tick crumble platforms after player tick
+    tickCrumblePlatforms(scaledDt);
+
+    // Detect landing (using justLanded flag to catch immediate rebounds)
+    if (playerCtrl.justLanded) {
+      playerCtrl.justLanded = false;
+
+      const offsetX = playerCtrl.lastLandingOffsetX;
+      const platW = playerCtrl.lastLandingPlatWidth;
+      const impactVel = playerCtrl.lastLandingVelY;
+
+      // Landing squash (proportional to impact)
+      landingSquash = clamp(impactVel / 8, 0.3, 1.0);
+
+      // Dust particles (velocity-based count)
+      const dustCount = Math.floor(clamp(impactVel * 1.5, 4, 16));
+      spawnParticles(playerCtrl.posX, playerCtrl.posY + 0.05, dustCount, '#C8A060', 0.6, 0.5);
+
+      // Landing shake (proportional to velocity)
+      triggerShake(clamp(impactVel * 0.5, 1, 6), 0.12);
+
+      // Platform flash
+      platformFlashIndex = playerCtrl.currentPlatformIndex;
+      platformFlashTimer = 0.15;
+
+      // Impact freeze for high-speed landings
+      if (impactVel > 5) {
+        impactFreezeTimer = 0.033;
+      }
+
+      // Perfect landing check: near center
+      if (offsetX < platW * 0.15) {
+        spawnPopup('PERFECT!', playerCtrl.posX, playerCtrl.posY + 0.8, '#FFD700');
+        // Gold burst particles
+        spawnParticles(playerCtrl.posX, playerCtrl.posY + 0.05, 14, '#FFD700', 0.8, 0.6);
+        // Energy bonus
+        playerCtrl.bounceEnergy01 = Math.min(1, playerCtrl.bounceEnergy01 + 0.08);
+        // Extra shake for perfect
+        triggerShake(4, 0.15);
+      }
+      // Near-miss check: barely caught the edge
+      else if (offsetX > platW * 0.35) {
+        spawnPopup('CLOSE!', playerCtrl.posX, playerCtrl.posY + 0.8, '#FF4444');
+        // Trigger slow-mo
+        slowMoTimer = 0.12;
+        timeScale = 0.3;
+        flashAlpha = 0.3;
+        cameraZoomTarget = 1.15;
+      }
+
+      // Spring landing effects
+      const landedPlat = platforms[playerCtrl.currentPlatformIndex];
+      if (landedPlat.type === 'spring') {
+        spawnParticles(playerCtrl.posX, playerCtrl.posY + 0.05, 6, '#40E040', 0.5, 0.4);
+        spawnPopup('BOOST!', playerCtrl.posX, playerCtrl.posY + 1.0, '#40E040');
+      }
+
+      // Crumble warning
+      if (landedPlat.type === 'crumble' && landedPlat.crumbleActive) {
+        spawnPopup('RUN!', playerCtrl.posX, playerCtrl.posY + 0.8, '#FF6030');
+      }
+    }
+
+    // Detect takeoff
+    if (lastGrounded && !playerCtrl.isGrounded) {
+      spawnParticles(playerCtrl.posX, playerCtrl.posY + 0.05, 6, '#FDE14A', 0.4, 0.4);
+      // Start timer on first launch
+      if (!runTimerActive) {
+        runTimerActive = true;
+      }
+    }
+    lastGrounded = playerCtrl.isGrounded;
+    if (playerCtrl.isGrounded) {
+      lastPlatformIndex = playerCtrl.currentPlatformIndex;
+    }
+
+    highestHeight = Math.max(highestHeight, playerCtrl.posY);
+    cameraAnchorX = platforms[playerCtrl.currentPlatformIndex].x;
+    cameraAnchorY = platforms[playerCtrl.currentPlatformIndex].y;
+
+    // Check victory
+    if (platforms[playerCtrl.currentPlatformIndex].isGoal) {
+      state = 'victory';
+      stateTimer = 0;
+      runTimerActive = false;
+      const isNewBest = personalBest === 0 || runTimer < personalBest;
+      if (isNewBest) {
+        personalBest = runTimer;
+        try { localStorage.setItem('towerRescue_pb', String(personalBest)); } catch(e) {}
+      }
+      newBestFlash = isNewBest;
+      const timeStr = formatTime(runTimer);
+      showOverlay('Theresa Saved!', `Time: ${timeStr}`, 'Tap anywhere or press R to restart.');
+    }
+    // Check defeat
+    else if (playerCtrl.posY < cameraAnchorY - FAIL_DROP_DISTANCE) {
+      state = 'defeat';
+      stateTimer = 0;
+      runTimerActive = false;
+      const timeStr = formatTime(runTimer);
+      showOverlay('Fell Into The Abyss', `Time: ${timeStr}  |  Attempt #${attemptCount}`, 'Tap anywhere or press R to restart.');
+    }
+  }
+
+  // Trail and popups tick
+  tickTrail(scaledDt);
+  tickPopups(dt);
+
+  tickCamera(scaledDt);
+  tickParticles(scaledDt);
+
+  // --- Render ---
+  CTX.clearRect(0, 0, CANVAS_W, CANVAS_H);
+  CTX.fillStyle = '#0A0808';
+  CTX.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+  drawBackground();
+  drawPlatforms();
+  drawTrail();
+  drawParticles();
+  drawPlayer();
+  drawTrajectoryPreview();
+  drawSpeedLines();
+  drawPopups();
+  drawFlash();
+  drawVignette();
+
+  // Reset shake for HUD (HUD should not shake)
+  const savedSX = shakeOffX, savedSY = shakeOffY;
+  shakeOffX = 0; shakeOffY = 0;
+  drawHud(dt);
+  shakeOffX = savedSX; shakeOffY = savedSY;
+}
+
+// --- Init ---
+// Load persistent data from localStorage
+try {
+  personalBest = parseFloat(localStorage.getItem('towerRescue_pb')) || 0;
+  attemptCount = parseInt(localStorage.getItem('towerRescue_attempts')) || 0;
+} catch(e) {
+  personalBest = 0;
+  attemptCount = 0;
+}
+
+buildLevel();
+setupInput();
+resizeCanvas();
+restartRun();
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
